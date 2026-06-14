@@ -1,0 +1,6 @@
+runpod==1.7.9
+numpy<2
+torch==2.1.2
+torchaudio==2.1.2
+speechbrain
+huggingface-hub<1
