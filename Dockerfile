@@ -9,8 +9,7 @@ WORKDIR /app
 
 # Pre-cache python deps in their own layer for faster rebuilds
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-RUN pip install --no-cache-dir hyperpyyaml
+RUN pip install --no-cache-dir -r requirements.txt hyperpyyaml
 
 # ── Pre-warm: bake the models into the image ──────────────────
 ARG HF_TOKEN
