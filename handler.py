@@ -1,98 +1,132 @@
-import array
-import audioop
+"""
+RunPod serverless handler — speaker embedding + compact LOO evaluation (ECAPA-TDNN).
+Separate from the production diarization handler.
+Deploy as a standalone endpoint; does not require pyannote.
+"""
+
 import base64
-import math
+import functools
 import os
-import statistics
 import tempfile
+import time
 import wave
 
+import numpy as np
 import runpod
 
-SAMPLE_RATE = 16000
+# ── Monkey-patch for torch 2.1.2 + SpeechBrain compatibility ──────
+import torch
+if not hasattr(torch.amp, 'custom_fwd'):
+    def _fake_custom_fwd(fwd=None, device_type=None, cast_inputs=None):
+        if fwd is None:
+            def deco(func):
+                @functools.wraps(func)
+                def w(*a, **k): return func(*a, **k)
+                return w
+            return deco
+        else:
+            @functools.wraps(fwd)
+            def w(*a, **k): return fwd(*a, **k)
+            return w
+    torch.amp.custom_fwd = _fake_custom_fwd
+    torch.amp.custom_bwd = _fake_custom_fwd
 
-# ── Embedding mode imports (lazy, only when mode=speaker_embedding) ─
-_embedding_classifier = None
+import torchaudio
+from speechbrain.inference.speaker import EncoderClassifier
 
-def _get_embedding_classifier():
-    global _embedding_classifier
-    if _embedding_classifier is None:
-        import functools, torch
-        if not hasattr(torch.amp, 'custom_fwd'):
-            def _fake_custom_fwd(fwd=None, device_type=None, cast_inputs=None):
-                if fwd is None:
-                    def deco(func):
-                        @functools.wraps(func)
-                        def w(*a, **k): return func(*a, **k)
-                        return w
-                    return deco
-                else:
-                    @functools.wraps(fwd)
-                    def w(*a, **k): return fwd(*a, **k)
-                    return w
-            torch.amp.custom_fwd = _fake_custom_fwd
-            torch.amp.custom_bwd = _fake_custom_fwd
+# ── Model cache ────────────────────────────────────────────────────
+_classifier = None
 
-        from speechbrain.inference.speaker import EncoderClassifier
-        import torchaudio
-        print("[embedding] Loading ECAPA-TDNN...", flush=True)
-        _embedding_classifier = EncoderClassifier.from_hparams(
+def get_classifier():
+    global _classifier
+    if _classifier is None:
+        print("[embedding] Loading ECAPA-TDNN model...", flush=True)
+        t0 = time.time()
+        _classifier = EncoderClassifier.from_hparams(
             source="speechbrain/spkrec-ecapa-voxceleb",
             savedir="/tmp/ecapa_model",
             run_opts={"device": "cuda" if torch.cuda.is_available() else "cpu"},
         )
-        print("[embedding] ECAPA loaded", flush=True)
-    return _embedding_classifier
+        print(f"[embedding] Model loaded in {time.time()-t0:.1f}s", flush=True)
+    return _classifier
 
 
-def _handle_embedding(data):
-    """Handle mode=speaker_embedding: compute ECAPA embeddings and similarities."""
-    import numpy as np, time, base64, tempfile, os, torch, torchaudio
+def decode_audio(audio_b64, tmpdir):
+    """Decode base64 WAV to file path, return (path, sample_rate, num_frames)."""
+    path = os.path.join(tmpdir, "audio.wav")
+    with open(path, "wb") as f:
+        f.write(base64.b64decode(audio_b64))
+    info = torchaudio.info(path)
+    return path, info.sample_rate, info.num_frames
 
-    classifier = _get_embedding_classifier()
+
+def load_audio(data, tmpdir):
+    """Load audio from audio_b64 or audio_url, return (path, sr, n_frames)."""
+    audio_url = data.get("audio_url")
+    if audio_url:
+        import urllib.request
+        path = os.path.join(tmpdir, "audio.wav")
+        print(f"[embedding] Downloading audio from {audio_url}...", flush=True)
+        urllib.request.urlretrieve(audio_url, path)
+        info = torchaudio.info(path)
+        return path, info.sample_rate, info.num_frames
+    else:
+        return decode_audio(data["audio_b64"], tmpdir)
+
+
+def extract_clip(waveform, sr, start_ms, end_ms):
+    """Extract audio segment and resample to 16kHz mono for ECAPA."""
+    start_sample = int(start_ms * sr / 1000)
+    end_sample = int(end_ms * sr / 1000)
+    if end_sample > waveform.shape[1]:
+        end_sample = waveform.shape[1]
+    if start_sample >= end_sample:
+        return None
+    clip = waveform[:, start_sample:end_sample]
+    if sr != 16000:
+        clip = torchaudio.functional.resample(clip, sr, 16000)
+    if clip.shape[1] < 8000:  # < 0.5s at 16kHz
+        return None
+    return clip
+
+
+def cos_sim(a, b):
+    """Cosine similarity between two numpy vectors."""
+    a = a.flatten(); b = b.flatten()
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+
+
+def handle_embedding(data):
+    """speaker_embedding mode: compute reference embeddings and score candidates."""
+    classifier = get_classifier()
     device = next(classifier.mods.parameters()).device
     t_start = time.time()
 
-    audio_b64 = data["audio_b64"]
     references = data.get("references") or []
     candidates = data.get("candidates") or []
 
     with tempfile.TemporaryDirectory() as tmp:
-        audio_path = os.path.join(tmp, "audio.wav")
-        with open(audio_path, "wb") as f:
-            f.write(base64.b64decode(audio_b64))
-
-        waveform, sr = torchaudio.load(audio_path)
+        audio_path, sr, n_frames = load_audio(data, tmp)
+        waveform, _ = torchaudio.load(audio_path)
         if waveform.shape[0] > 1:
             waveform = waveform.mean(dim=0, keepdim=True)
 
-        print(f"[embedding] Audio: {list(waveform.shape)} @ {sr}Hz, device={device}",
+        print(f"[embedding] Audio: {n_frames} frames @ {sr}Hz, "
+              f"waveform shape={list(waveform.shape)}, device={device}",
               flush=True)
 
-        def extract_clip(ws, sr, start_ms, end_ms):
-            ss = int(start_ms * sr / 1000)
-            es = int(end_ms * sr / 1000)
-            if es > ws.shape[1]: es = ws.shape[1]
-            if ss >= es or (es - ss) < 8000:  # min 0.5s at 16kHz
-                return None
-            clip = ws[:, ss:es]
-            if sr != 16000:
-                clip = torchaudio.functional.resample(clip, sr, 16000)
-            return clip
-
-        # Smoke-test with a 4s clip
+        # Smoke-test: encode a 4s clip to verify model health
         test_clip = extract_clip(waveform, sr, 1000, 5000)
         if test_clip is not None:
             test_clip = test_clip.to(device)
             with torch.no_grad():
-                t0 = time.time()
-                test_emb = classifier.encode_batch(test_clip.unsqueeze(0))
-                enc_ms = (time.time() - t0) * 1000
-            print(f"[embedding] Smoke: input={list(test_clip.shape)} "
-                  f"output={list(test_emb.shape)} time={enc_ms:.0f}ms device={device}",
-                  flush=True)
+                t_enc = time.time()
+                test_emb = classifier.encode_batch(test_clip)
+                enc_time = time.time() - t_enc
+            print(f"[embedding] Test embedding shape: {list(test_emb.shape)}, "
+                  f"encode time: {enc_time:.3f}s", flush=True)
 
-        # Reference embeddings
+        # ── Compute reference embeddings ─────────────────────────────
         ref_embeddings = {}
         for ref in references:
             char = ref["character"]
@@ -100,31 +134,30 @@ def _handle_embedding(data):
             embs = []
             for seg in segments:
                 clip = extract_clip(waveform, sr, seg["start_ms"], seg["end_ms"])
-                if clip is None: continue
+                if clip is None:
+                    continue
                 clip = clip.to(device)
                 with torch.no_grad():
-                    emb = classifier.encode_batch(clip.unsqueeze(0))
+                    emb = classifier.encode_batch(clip)
                 embs.append(emb.squeeze().cpu().numpy())
+
             if embs:
                 ref_embeddings[char] = {
                     "mean": np.mean(embs, axis=0),
                     "count": len(embs),
                 }
 
-        # Score candidates
-        def cos_sim(a, b):
-            a = a.flatten(); b = b.flatten()
-            return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
-
+        # ── Score candidates ─────────────────────────────────────────
         results = []
         for cand in candidates:
             clip = extract_clip(waveform, sr, cand["start_ms"], cand["end_ms"])
             if clip is None:
                 results.append({"index": cand["index"], "error": "clip_too_short"})
                 continue
+
             clip = clip.to(device)
             with torch.no_grad():
-                emb = classifier.encode_batch(clip.unsqueeze(0))
+                emb = classifier.encode_batch(clip)
             emb = emb.squeeze().cpu().numpy()
 
             scores = {}
@@ -145,353 +178,181 @@ def _handle_embedding(data):
                 "margin": round(best[1] - second[1], 6),
             })
 
-    elapsed = time.time() - t_start
-    print(f"[embedding] Done: {len(candidates)} candidates in {elapsed:.1f}s", flush=True)
+    total_time = time.time() - t_start
+    print(f"[embedding] Complete: {len(candidates)} candidates in {total_time:.1f}s", flush=True)
+
     return {
-        "ok": True, "mode": "speaker_embedding",
-        "device": str(device), "processing_time_s": round(elapsed, 3),
-        "reference_embeddings": {ch: {"count": rd["count"]} for ch, rd in ref_embeddings.items()},
+        "ok": True,
+        "mode": "speaker_embedding",
+        "device": str(device),
+        "processing_time_s": round(total_time, 3),
+        "reference_embeddings": {
+            ch: {"count": rd["count"]}
+            for ch, rd in ref_embeddings.items()
+        },
         "candidates": results,
     }
 
 
+def handle_loo_evaluation(data):
+    """loo_evaluation mode: compact LOO with pre-aligned anchor clips.
+    
+    Accepts: audio_b64 or audio_url, anchors: [{index, character, start_ms, end_ms}]
+    Encodes all anchors once, runs LOO at multiple thresholds, returns metrics.
+    """
+    from collections import defaultdict
+
+    classifier = get_classifier()
+    device = next(classifier.mods.parameters()).device
+    t_start = time.time()
+
+    anchors = data.get("anchors") or []
+    if not anchors:
+        return {"ok": False, "error": "no anchors provided", "retryable": False}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio_path, sr, n_frames = load_audio(data, tmp)
+        waveform, _ = torchaudio.load(audio_path)
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+
+        print(f"[loo] Audio: {n_frames} frames @ {sr}Hz, {len(anchors)} anchors, device={device}",
+              flush=True)
+
+        # Step 1: Encode all anchors
+        print("[loo] Encoding all anchors...", flush=True)
+        t_enc = time.time()
+        embeddings = {}  # index -> numpy embedding
+        for a in anchors:
+            clip = extract_clip(waveform, sr, a["start_ms"], a["end_ms"])
+            if clip is None:
+                embeddings[a["index"]] = None
+                continue
+            clip = clip.to(device)
+            with torch.no_grad():
+                emb = classifier.encode_batch(clip)
+            embeddings[a["index"]] = emb.squeeze().cpu().numpy()
+
+        valid = sum(1 for e in embeddings.values() if e is not None)
+        enc_time = time.time() - t_enc
+        print(f"[loo] Encoded {valid}/{len(anchors)} in {enc_time:.1f}s", flush=True)
+
+        if valid == 0:
+            return {"ok": False, "error": "no valid anchor clips extracted", "retryable": False}
+
+        # Step 2: Group by character
+        by_char = defaultdict(list)
+        for a in anchors:
+            by_char[a["character"]].append(a)
+
+        # Step 3: Run LOO at multiple thresholds
+        THRESHOLDS = [0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85]
+        MARGINS = [0.03, 0.05, 0.08, 0.10, 0.12, 0.15]
+
+        all_results = []
+        print("[loo] Computing LOO...", flush=True)
+
+        for st in THRESHOLDS:
+            for mg in MARGINS:
+                correct = 0
+                incorrect = 0
+                rejected = 0
+                confusions = defaultdict(lambda: defaultdict(int))
+
+                for a in anchors:
+                    e = embeddings.get(a["index"])
+                    if e is None:
+                        rejected += 1
+                        continue
+                    tc = a["character"]
+
+                    # Build per-character mean embeddings EXCLUDING this anchor
+                    char_means = {}
+                    for ch, lst in by_char.items():
+                        other_embs = [embeddings[aa["index"]] for aa in lst
+                                      if aa["index"] != a["index"] and embeddings.get(aa["index"]) is not None]
+                        if other_embs:
+                            char_means[ch] = np.mean(other_embs, axis=0)
+
+                    if len(char_means) < 2:
+                        rejected += 1
+                        continue
+
+                    scores = {ch: cos_sim(e, m) for ch, m in char_means.items()}
+                    sorted_ch = sorted(scores.items(), key=lambda x: -x[1])
+                    best_ch, best_score = sorted_ch[0]
+                    second_score = sorted_ch[1][1] if len(sorted_ch) > 1 else 0.0
+
+                    if best_score < st or (best_score - second_score + 1e-9) < mg:
+                        rejected += 1
+                    elif best_ch == tc:
+                        correct += 1
+                    else:
+                        incorrect += 1
+                        confusions[tc][best_ch] += 1
+
+                total = correct + incorrect + rejected
+                if total == 0:
+                    continue
+                prec = correct / (correct + incorrect) if (correct + incorrect) > 0 else 0
+                cov = correct / total
+                f1 = 2 * prec * cov / (prec + cov) if (prec + cov) > 0 else 0
+
+                all_results.append({
+                    "similarity_threshold": round(st, 2),
+                    "margin": round(mg, 2),
+                    "correct": correct,
+                    "incorrect": incorrect,
+                    "rejected": rejected,
+                    "precision": round(prec, 4),
+                    "coverage": round(cov, 4),
+                    "f1": round(f1, 4),
+                    "confusion_pairs": {tc: dict(pm) for tc, pm in confusions.items() if pm},
+                })
+
+    total_time = time.time() - t_start
+    print(f"[loo] Done in {total_time:.1f}s", flush=True)
+
+    # Find best results
+    best_f1 = max(all_results, key=lambda r: r["f1"])
+    best_prec = max([r for r in all_results if r["precision"] >= 0.95],
+                    key=lambda r: r["coverage"], default=best_f1)
+
+    return {
+        "ok": True,
+        "mode": "loo_evaluation",
+        "device": str(device),
+        "total_anchors": len(anchors),
+        "valid_anchors": valid,
+        "encoding_time_s": round(enc_time, 3),
+        "processing_time_s": round(total_time, 3),
+        "best_f1": best_f1,
+        "best_precision_ge_095": best_prec,
+        "all_results": all_results,
+    }
+
+
 def handler(event):
+    """Top-level handler — dispatches by mode."""
     data = event.get("input") or {}
 
-    # ── Speaker embedding mode ──────────────────────────────────────
     if data.get("mode") == "speaker_embedding":
         try:
-            return _handle_embedding(data)
+            return handle_embedding(data)
         except Exception as exc:
             import traceback
             traceback.print_exc()
             return {"ok": False, "error": str(exc), "retryable": False}
 
-    # ── Standard pyannote diarization below ─────────────────────────
-    try:
-        audio_b64 = data["audio_b64"]
-        segments = data.get("segments") or []
-        settings = data.get("settings") or {}
-        with tempfile.TemporaryDirectory() as tmp:
-            audio_path = os.path.join(tmp, "audio.wav")
-            with open(audio_path, "wb") as fh:
-                fh.write(base64.b64decode(audio_b64))
-            turns = _run_pyannote(audio_path, settings)
-            mixed_by_index = _mixed_speaker_marks(segments, turns, settings)
-            profiled = []
-            for seg in segments:
-                profile = _profile_segment(audio_path, seg, turns, settings)
-                profile.update(mixed_by_index.get(int(seg.get("index") or 0), {}))
-                profiled.append({**seg, **profile})
-            profiled = _stabilize_speaker_profiles(profiled, settings)
-            return {
-                "ok": True,
-                "provider": "runpod_pyannote",
-                "segments": profiled,
-                "turns": turns,
-                "warnings": [],
-            }
-    except Exception as exc:
-        return {"ok": False, "error": str(exc), "retryable": True}
-
-
-def _run_pyannote(audio_path, settings):
-    """Run pyannote diarization. Loads from local cache first (no token
-    required when the model was baked into the image at build time).
-    Falls back to authenticated download if cache is empty. Logs every
-    branch so worker logs explain why we end up with empty turns."""
-    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-    model = settings.get("pyannote_model") or os.environ.get(
-        "PYANNOTE_MODEL", "pyannote/speaker-diarization-3.1"
-    )
-    try:
-        from pyannote.audio import Pipeline
-    except Exception as exc:
-        print(f"[pyannote] FATAL: cannot import pyannote.audio: {exc}", flush=True)
-        return []
-
-    pipeline = None
-
-    # Attempt 1: load with token (newer arg name)
-    if token:
+    if data.get("mode") == "loo_evaluation":
         try:
-            pipeline = Pipeline.from_pretrained(model, token=token)
-            print(f"[pyannote] loaded model={model} with HF_TOKEN", flush=True)
-        except TypeError:
-            try:
-                pipeline = Pipeline.from_pretrained(model, use_auth_token=token)
-                print(f"[pyannote] loaded model={model} with use_auth_token", flush=True)
-            except Exception as exc:
-                print(f"[pyannote] auth-load failed: {exc}", flush=True)
-                pipeline = None
+            return handle_loo_evaluation(data)
         except Exception as exc:
-            print(f"[pyannote] token-load failed: {exc}", flush=True)
-            pipeline = None
+            import traceback
+            traceback.print_exc()
+            return {"ok": False, "error": str(exc), "retryable": False}
 
-    # Attempt 2: load WITHOUT token. Works when the model was baked into
-    # the image at build time (Dockerfile pre-warm) — HF cache is local,
-    # no auth needed.
-    if pipeline is None:
-        try:
-            pipeline = Pipeline.from_pretrained(model)
-            print(f"[pyannote] loaded model={model} from local cache (no token needed)", flush=True)
-        except Exception as exc:
-            print(f"[pyannote] FATAL: model load failed both with and without token: {exc}", flush=True)
-            return []
-
-    try:
-        diarization = pipeline(audio_path)
-    except Exception as exc:
-        print(f"[pyannote] FATAL: diarization run failed: {exc}", flush=True)
-        return []
-
-    label_map = {}
-    turns = []
-    for turn, _, label in diarization.itertracks(yield_label=True):
-        if label not in label_map:
-            label_map[label] = f"AUDIO_SPK_{len(label_map):02d}"
-        turns.append(
-            {
-                "start_ms": int(float(turn.start) * 1000),
-                "end_ms": int(float(turn.end) * 1000),
-                "audio_speaker_id": label_map[label],
-            }
-        )
-    print(f"[pyannote] returning {len(turns)} turns, {len(label_map)} unique speakers", flush=True)
-    return turns
-
-
-def _mixed_speaker_marks(segments, turns, settings):
-    if not turns:
-        return {}
-    min_turn_ms = int(settings.get("mixed_speaker_min_turn_ms", 450))
-    min_ratio = float(settings.get("mixed_speaker_min_turn_ratio", 0.12))
-    marks = {}
-    for seg in segments:
-        start_ms = int(seg.get("start_ms") or 0)
-        end_ms = int(seg.get("end_ms") or start_ms)
-        duration = max(1, end_ms - start_ms)
-        totals = {}
-        overlaps = []
-        for turn in turns:
-            turn_start = int(turn.get("start_ms") or 0)
-            turn_end = int(turn.get("end_ms") or turn_start)
-            audio_id = turn.get("audio_speaker_id") or ""
-            overlap = max(0, min(end_ms, turn_end) - max(start_ms, turn_start))
-            if not audio_id or overlap <= 0:
-                continue
-            totals[audio_id] = totals.get(audio_id, 0) + overlap
-            overlaps.append({
-                "audio_speaker_id": audio_id,
-                "start_ms": max(start_ms, turn_start),
-                "end_ms": min(end_ms, turn_end),
-                "overlap_ms": overlap,
-            })
-        strong_ids = [
-            audio_id
-            for audio_id, overlap in totals.items()
-            if overlap >= min_turn_ms or (overlap / duration) >= min_ratio
-        ]
-        if len(strong_ids) > 1:
-            marks[int(seg.get("index") or 0)] = {
-                "mixed_speaker_detected": True,
-                "mixed_speaker_count": len(strong_ids),
-                "mixed_speaker_turns": overlaps,
-                "speaker_profile_conflict": True,
-            }
-    return marks
-
-
-def _profile_segment(audio_path, seg, turns, settings):
-    start_ms = int(seg.get("start_ms") or 0)
-    end_ms = int(seg.get("end_ms") or start_ms)
-    best_turn = _best_overlap_turn(start_ms, end_ms, turns, settings)
-    audio_speaker_id = best_turn["audio_speaker_id"] if best_turn else ""
-    source = "runpod_pyannote" if best_turn else "runpod_pitch"
-    f0_values, voiced_ms = _estimate_segment_f0(audio_path, start_ms, end_ms, settings)
-    gender, confidence, median_f0 = _classify_gender(f0_values, voiced_ms, settings)
-    if not audio_speaker_id and gender != "unknown":
-        audio_speaker_id = f"PITCH_{gender.upper()}_00"
-    if gender == "unknown":
-        source = "text_fallback"
-    return {
-        "audio_speaker_id": audio_speaker_id,
-        "audio_gender": gender,
-        "audio_gender_confidence": round(confidence, 3),
-        "speaker_profile_source": source,
-        "speaker_profile_f0_hz": round(median_f0, 1),
-        "speaker_profile_voiced_ms": int(voiced_ms),
-        "speaker_profile_overlap_ms": int(best_turn.get("overlap_ms", 0)) if best_turn else 0,
-        "speaker_profile_overlap_ratio": round(best_turn.get("overlap_ratio", 0.0), 3) if best_turn else 0.0,
-    }
-
-
-def _best_overlap_turn(start_ms, end_ms, turns, settings):
-    best = None
-    best_overlap = 0
-    second_overlap = 0
-    duration = max(1, end_ms - start_ms)
-    for turn in turns:
-        overlap = max(0, min(end_ms, turn["end_ms"]) - max(start_ms, turn["start_ms"]))
-        if overlap > best_overlap:
-            second_overlap = best_overlap
-            best = turn
-            best_overlap = overlap
-        elif overlap > second_overlap:
-            second_overlap = overlap
-    min_overlap_ms = int(settings.get("min_overlap_ms", 350))
-    min_overlap_ratio = float(settings.get("min_overlap_ratio", 0.30))
-    min_margin_ms = int(settings.get("min_top_margin_ms", 150))
-    overlap_ratio = best_overlap / duration
-    if best is None:
-        return None
-    if best_overlap < min_overlap_ms and overlap_ratio < min_overlap_ratio:
-        return None
-    if second_overlap and (best_overlap - second_overlap) < min_margin_ms:
-        return None
-    out = dict(best)
-    out["overlap_ms"] = best_overlap
-    out["overlap_ratio"] = overlap_ratio
-    return out
-
-
-def _estimate_segment_f0(audio_path, start_ms, end_ms, settings):
-    try:
-        with wave.open(audio_path, "rb") as wf:
-            rate = wf.getframerate()
-            width = wf.getsampwidth()
-            start_frame = max(0, int(start_ms * rate / 1000))
-            end_frame = max(start_frame, int(end_ms * rate / 1000))
-            wf.setpos(min(start_frame, wf.getnframes()))
-            raw = wf.readframes(max(0, min(end_frame, wf.getnframes()) - start_frame))
-    except Exception:
-        return [], 0
-    if not raw:
-        return [], 0
-    win = int(rate * 0.050)
-    hop = int(rate * 0.100)
-    min_voiced = int(settings.get("min_voiced_ms", 500))
-    values = []
-    voiced_ms = 0
-    total_windows = max(1, (len(raw) // width - win) // max(1, hop) + 1)
-    step = max(1, math.ceil(total_windows / 30))
-    for pos in range(0, max(1, len(raw) // width - win + 1), hop * step):
-        chunk = raw[pos * width : (pos + win) * width]
-        if len(chunk) < win * width or audioop.rms(chunk, width) < 180:
-            continue
-        f0 = _estimate_f0(chunk, rate, width)
-        if f0:
-            values.append(f0)
-            voiced_ms += int((hop * step) * 1000 / rate)
-    if voiced_ms < min_voiced:
-        return values, voiced_ms
-    return values, voiced_ms
-
-
-def _estimate_f0(raw, rate, width):
-    samples = array.array("h")
-    samples.frombytes(raw)
-    if width != 2 or len(samples) < 200:
-        return None
-    mean = sum(samples) / len(samples)
-    vals = [float(s - mean) for s in samples]
-    energy = sum(v * v for v in vals)
-    if energy <= 1:
-        return None
-    min_lag = int(rate / 400)
-    max_lag = int(rate / 60)
-    best_lag = 0
-    best_score = 0.0
-    for lag in range(min_lag, min(max_lag, len(vals) // 2)):
-        corr = 0.0
-        lag_energy = 0.0
-        for i in range(len(vals) - lag):
-            corr += vals[i] * vals[i + lag]
-            lag_energy += vals[i + lag] * vals[i + lag]
-        score = corr / math.sqrt(max(energy * lag_energy, 1.0))
-        if score > best_score:
-            best_score = score
-            best_lag = lag
-    return rate / best_lag if best_lag and best_score >= 0.35 else None
-
-
-def _classify_gender(f0_values, voiced_ms, settings):
-    min_voiced = int(settings.get("min_voiced_ms", 500))
-    if not f0_values or voiced_ms < min_voiced:
-        return "unknown", 0.0, 0.0
-    median_f0 = statistics.median(f0_values)
-    if median_f0 >= 275:
-        return "child", min(0.95, 0.72 + (median_f0 - 275) / 250), median_f0
-    if median_f0 >= 185:
-        return "female", min(0.95, 0.70 + (median_f0 - 185) / 180), median_f0
-    if median_f0 <= 155:
-        return "male", min(0.95, 0.70 + (155 - median_f0) / 120), median_f0
-    distance = min(abs(median_f0 - 155), abs(median_f0 - 185))
-    return "unknown", max(0.35, min(0.68, distance / 30)), median_f0
-
-
-def _stabilize_speaker_profiles(segments, settings):
-    groups = {}
-    for seg in segments:
-        audio_id = seg.get("audio_speaker_id") or ""
-        if audio_id.startswith("AUDIO_SPK_"):
-            groups.setdefault(audio_id, []).append(seg)
-    if not groups:
-        return segments
-    min_conf = float(settings.get("min_confidence", 0.70))
-    dominance = float(settings.get("dominance_ratio", 0.72))
-    stable = {}
-    for audio_id, rows in groups.items():
-        scores = {"male": 0.0, "female": 0.0, "child": 0.0}
-        best_conf = {"male": 0.0, "female": 0.0, "child": 0.0}
-        f0_values = []
-        voiced_total = 0
-        strong_genders = set()
-        for row in rows:
-            gender = str(row.get("audio_gender") or "unknown").lower()
-            conf = float(row.get("audio_gender_confidence") or 0.0)
-            voiced_ms = int(row.get("speaker_profile_voiced_ms") or 0)
-            f0 = float(row.get("speaker_profile_f0_hz") or 0.0)
-            voiced_total += max(0, voiced_ms)
-            if f0 > 0 and gender != "unknown":
-                f0_values.append(f0)
-            if gender in scores and conf >= min_conf:
-                scores[gender] += max(1, voiced_ms) * conf
-                best_conf[gender] = max(best_conf[gender], conf)
-                strong_genders.add(gender)
-        total_score = sum(scores.values())
-        top_gender = max(scores, key=scores.get)
-        ratio = (scores[top_gender] / total_score) if total_score > 0 else 0.0
-        conflict = len(strong_genders) > 1 and ratio < dominance
-        if scores[top_gender] > 0 and ratio >= dominance and not conflict:
-            gender = top_gender
-            confidence = min(0.98, max(best_conf[top_gender], ratio))
-        else:
-            gender = "unknown"
-            confidence = round(ratio, 3) if total_score > 0 else 0.0
-        stable[audio_id] = {
-            "gender": gender,
-            "confidence": confidence,
-            "conflict": conflict,
-            "dominance": round(ratio, 3),
-            "f0": round(statistics.median(f0_values), 1) if f0_values else 0.0,
-            "voiced_ms": voiced_total,
-        }
-    for seg in segments:
-        decision = stable.get(seg.get("audio_speaker_id") or "")
-        if not decision:
-            seg["speaker_profile_conflict"] = False
-            continue
-        seg["audio_gender_segment"] = seg.get("audio_gender", "unknown")
-        seg["audio_gender_confidence_segment"] = seg.get("audio_gender_confidence", 0.0)
-        seg["audio_gender"] = decision["gender"]
-        seg["audio_gender_confidence"] = round(decision["confidence"], 3)
-        seg["speaker_profile_source"] = "runpod_pyannote"
-        seg["speaker_profile_conflict"] = decision["conflict"]
-        seg["speaker_profile_dominance"] = decision["dominance"]
-        seg["speaker_profile_f0_hz"] = decision["f0"]
-        seg["speaker_profile_voiced_ms"] = decision["voiced_ms"]
-    return segments
+    return {"ok": False, "error": f"unknown mode: {data.get('mode')}. Expected speaker_embedding or loo_evaluation"}
 
 
 if __name__ == "__main__":
